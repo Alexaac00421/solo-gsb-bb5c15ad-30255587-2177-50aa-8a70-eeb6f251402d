@@ -1,0 +1,21 @@
+services:
+  claim-service:
+    build: .
+    image: express-claim-service:1.0.0
+    container_name: express-claim-service
+    ports:
+      - "8000:8000"
+    environment:
+      CLAIM_DATA_DIR: /data
+      CLAIM_DEFAULT_CUTOFF: "23:59:59"
+    volumes:
+      - claim-data:/data
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+
+volumes:
+  claim-data:

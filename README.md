@@ -8,6 +8,7 @@
 - 逐条可审计的**判定依据**（含适用政策版本、起算事件、跳节假日说明、更正记录）；
 - **理赔申请受理**：按服务实际接收时间实时核验并出具不可变申请凭证（幂等受理、同类型唯一、可查询）。
 - **节假日表工作日诊断**：提交日历/时区/带偏移起始时刻/工作日数/截止钟点，只读逐日解释第 N 个工作日如何得出（含放假跳过、周末补班计入），返回当地与 UTC 截止时刻。
+- **跨订单理赔待办快照**：按带偏移的核对时刻冻结全量待办（重算三类资格、含已有凭证与能否再次申请），游标分页且翻页期间结果不变，游标 30 分钟过期。
 
 ## 判定规则
 
@@ -149,6 +150,62 @@ curl -s -X POST http://localhost:8000/api/v1/calendars/diagnose \
    - 并发放心重试：进程内写锁串行化 + 数据库 `UNIQUE(order_id, claim_type)`、`UNIQUE(order_id, idempotency_key)` 双保险，并发不同键也不会双重受理。
 5. **凭证一经受理不可变**：之后的更正或新代只影响"当前判定"，凭证冻结的政策、截止时间与判定依据永不改变。`GET /api/v1/claims/{claim_no}` 可查凭证及其所依据的判定代号；`GET /api/v1/orders/{id}/claims` 列订单全部凭证。
 
+### 跨订单理赔待办快照（本轮新增）
+
+运营按**核对时刻**生成全量待办快照：`POST /api/v1/claim-todos` 为首请求，`GET /api/v1/claim-todos?cursor=...` 逐页取数。
+
+1. **首请求固定完整结果**：请求体给带偏移的 `as_of`（核对时刻）与 `page_size`（每页 1～100 条）。系统只纳入**不晚于该时刻**创建的订单、到达的扫描和受理的凭证，按**订单锁定的政策版本、订单时区与节假日表**重算三类理赔资格——**归档判定不替代该时点重算**（与理赔受理口径一致，不读归档快照）。完整结果自首请求起冻结，按**订单号、理赔类型（delay → damage → loss）**排序，返回第 1 页。
+2. **每条返回**：订单号 `order_id`、理赔类型 `claim_type`/`claim_name`、资格状态 `status`、当地与 UTC 截止时刻 `deadline_local`/`deadline_utc`、缺失证据 `missing_evidence`、已有凭证编号 `voucher_nos`、能否再次申请 `can_apply_again`。**已有凭证的类型一律不可再次申请**（即使当时仍 filable）；其他类型保持各自判定（`filable` 才可申请）。
+3. **游标翻页**：每页返回 `total`（总数）、`entries`、`next_cursor`（最后一页为 `null`）及 `page`/`page_count`。翻页期间即使有新订单、扫描或凭证，**既有条目、总数和顺序均不改变**（页面只读首请求冻结的快照）。游标自**快照创建起 30 分钟**过期。
+
+```bash
+# 首请求：创建快照并取第 1 页
+curl -s -X POST http://localhost:8000/api/v1/claim-todos \
+  -H 'Content-Type: application/json' \
+  -d '{"as_of": "2025-02-20T12:00:00+08:00", "page_size": 50}'
+
+# 后续页：原样带上上一页响应的 next_cursor
+curl -s "http://localhost:8000/api/v1/claim-todos?cursor=TS-20250220040000-9F2A1C77:2"
+```
+
+响应节选：
+
+```json
+{
+  "snapshot_id": "TS-20250220040000-9F2A1C77",
+  "as_of_utc": "2025-02-20T04:00:00+00:00",
+  "created_at_utc": "2025-02-20T04:00:00.182344+00:00",
+  "expires_at_utc": "2025-02-20T04:30:00.182344+00:00",
+  "cursor_ttl_seconds": 1800,
+  "page_size": 50, "total": 6, "page": 1, "page_count": 1,
+  "entries": [
+    {"order_id": "O-1001", "claim_type": "delay", "claim_name": "延迟送达",
+     "status": "filable",
+     "deadline_local": "2025-02-25T23:59:59+08:00",
+     "deadline_utc": "2025-02-25T15:59:59+00:00",
+     "missing_evidence": [], "voucher_nos": ["CLM-20250213020000-1A2B3C4D"],
+     "can_apply_again": false},
+    {"order_id": "O-1001", "claim_type": "damage", "claim_name": "货物破损",
+     "status": "pending", "deadline_local": null, "deadline_utc": null,
+     "missing_evidence": ["damage_reported"], "voucher_nos": [],
+     "can_apply_again": false}
+  ],
+  "next_cursor": null
+}
+```
+
+明确拒绝（均为统一错误体）：
+
+| 情形 | 状态码 | 错误码 |
+|---|---|---|
+| `as_of` 缺失 / 无时区偏移（naive） | 422 | `INVALID_REQUEST` |
+| `page_size` 缺失或越出 1～100 | 422 | `INVALID_REQUEST` |
+| `cursor` 缺失 | 422 | `INVALID_REQUEST` |
+| 游标格式错误 / 指向不存在的快照 / 页码越界 | 422 | `CURSOR_INVALID` |
+| 游标自快照创建起超过 30 分钟 | 410 | `CURSOR_EXPIRED` |
+
+> 说明：快照行只插入不修改（新表 `todo_snapshots`，建表语句带 `IF NOT EXISTS`，老数据目录重启即自动升级）；过期快照仅拒绝访问，不影响既有数据。
+
 ## 目录结构
 
 ```
@@ -164,7 +221,7 @@ app/
   main.py          # FastAPI 路由
 init_db.py         # 初始化入口（建表 + 种子，幂等）
 examples/call_api.py  # 端到端调用示例（仅标准库，含理赔申请与日历诊断全链路）
-tests/             # pytest 引擎单测 + API 端到端测试（89 个用例）
+tests/             # pytest 引擎单测 + API 端到端测试（99 个用例）
 Dockerfile, docker-compose.yml
 ```
 
@@ -228,6 +285,8 @@ pytest -q
 | POST | `/api/v1/orders/{id}/claims` | **提交理赔申请**：按接收时间实时核验，filable 则出不可变凭证（幂等） |
 | GET | `/api/v1/orders/{id}/claims` | 该订单全部已受理凭证 |
 | GET | `/api/v1/claims/{claim_no}` | 按申请编号查凭证及其判定代号/冻结依据 |
+| POST | `/api/v1/claim-todos` | **理赔待办快照首请求**：按核对时刻冻结全量待办，返回第 1 页与下一游标 |
+| GET | `/api/v1/claim-todos?cursor=...` | **游标翻页**：结果固定不变；游标 30 分钟过期 |
 | GET | `/api/v1/policies` | 政策版本列表 |
 | GET | `/api/v1/calendars/{code}` | 节假日表 |
 | POST | `/api/v1/calendars/diagnose` | **节假日表工作日诊断**（只读）：逐日列出工作/休息判定、补班/放假声明、默认规则、累计工作日数与跳过原因，返回第 N 个工作日的当地/UTC 截止时刻 |
@@ -431,6 +490,13 @@ curl -s -X POST http://localhost:8000/api/v1/orders/O-1001/claims \
 - **新增政策版本**：向 `policies` 表插入一行 JSON（时限天数、工作日/自然日、截止钟点均可配），无需发版；新增节假日在 `calendars` 表 upsert。
 - **新增理赔类型/扫描事件**：在 `constants.py` 登记标签、政策 JSON 增规则、`engine.py` 增加一个 resolver，接口与代际机制无需改动。
 - 截止钟点默认 23:59:59，可被政策窗口级 `cutoff` 或环境变量 `CLAIM_DEFAULT_CUTOFF` 覆盖。
+
+### v1.3.0 变动（跨订单理赔待办快照）
+
+- 新增 `POST /api/v1/claim-todos`（首请求）与 `GET /api/v1/claim-todos?cursor=...`（游标翻页）：按带偏移的核对时刻生成跨订单待办快照，只纳入不晚于该时刻创建的订单、到达的扫描和受理的凭证；按订单锁定政策、订单时区与日历重算三类资格，归档快照不替代该时点重算。
+- 每条含订单号、理赔类型、资格状态、当地与 UTC 截止、缺失证据、已有凭证编号与能否再次申请；已有凭证的类型一律不可再次申请，其他类型保持各自判定。
+- 首请求冻结完整结果并按订单号、理赔类型（delay → damage → loss）排序；每页返回总数、条目与下一游标；翻页期间新订单/扫描/凭证不改变既有条目、总数与顺序；游标自快照创建起 30 分钟过期（410 `CURSOR_EXPIRED`），无效游标 422 `CURSOR_INVALID`，时刻缺偏移/页大小越界 422 `INVALID_REQUEST`。
+- 新增只追加表 `todo_snapshots`（建表语句带 `IF NOT EXISTS`，老数据目录重启即自动升级）；既有接口、启动方式（`docker compose up --build` 自动初始化）与统一错误体约定**完全保持不变**；测试由 89 个增至 99 个。
 
 ### v1.2.0 变动（节假日表工作日诊断）
 

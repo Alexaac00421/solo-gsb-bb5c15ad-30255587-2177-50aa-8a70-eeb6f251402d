@@ -13,7 +13,9 @@
 7. 查询判定历史；
 8. 理赔申请：按接收时间核验受理并生成不可变凭证（含幂等重试/换类型冲突/
    同类型重复受理/非 filable 拒绝/凭证查询）；
-9. 节假日表工作日诊断：只读逐日列出工作/休息判定与截止时刻（含非法参数拒绝）。
+9. 节假日表工作日诊断：只读逐日列出工作/休息判定与截止时刻（含非法参数拒绝）；
+10. 跨订单理赔待办快照：首请求按核对时刻冻结完整结果并分页返回，
+    游标翻页（30 分钟过期），含非法参数/无效游标拒绝示例。
 """
 import json
 import os
@@ -144,8 +146,47 @@ def main():
 
     claim_demo()
     calendar_diagnose_demo()
+    todo_snapshot_demo()
 
     print("\n示例完成。交互文档：" + BASE + "/docs")
+
+
+def todo_snapshot_demo():
+    """跨订单理赔待办快照：首请求冻结完整结果，游标翻页（30 分钟过期）。"""
+    print("\n\n########## 理赔待办快照演示 ##########")
+    as_of = "2025-02-20T12:00:00+08:00"          # 必须带时区偏移
+    r = call("POST", "/api/v1/claim-todos", {"as_of": as_of, "page_size": 5})
+    if r is None:
+        return
+    print(f"快照 {r['snapshot_id']} | 核对时刻(UTC) {r['as_of_utc']} | "
+          f"总数 {r['total']} | 每页 {r['page_size']} | 共 {r['page_count']} 页 | "
+          f"游标 {r['cursor_ttl_seconds'] // 60} 分钟内有效")
+
+    def show_page(p):
+        for e in p["entries"]:
+            print(f"  {e['order_id']} | {e['claim_type']}({e['claim_name']}) | "
+                  f"{e['status']} | 截止 {e['deadline_local']} | "
+                  f"缺失证据 {e['missing_evidence']} | 凭证 {e['voucher_nos']} | "
+                  f"可再次申请 {e['can_apply_again']}")
+
+    print("-- 第 1 页 --")
+    show_page(r)
+    cursor = r["next_cursor"]
+    while cursor:                                # 翻页期间结果固定不变
+        p = call("GET", "/api/v1/claim-todos", params={"cursor": cursor})
+        if p is None:
+            break
+        print(f"-- 第 {p['page']} 页 --")
+        show_page(p)
+        cursor = p["next_cursor"]
+
+    # 非法参数示例：时刻无偏移 / 页大小越界 / 无效游标，均被明确拒绝
+    print("\n--- 非法参数拒绝示例 ---")
+    call("POST", "/api/v1/claim-todos",
+         {"as_of": "2025-02-20T12:00:00", "page_size": 5})      # 缺偏移 -> 422
+    call("POST", "/api/v1/claim-todos",
+         {"as_of": as_of, "page_size": 101})                    # 越界 -> 422
+    call("GET", "/api/v1/claim-todos", params={"cursor": "bad-cursor"})  # -> 422
 
 
 def calendar_diagnose_demo():

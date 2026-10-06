@@ -29,3 +29,7 @@ ERR_CLAIM_INDETERMINATE = ("CLAIM_INDETERMINATE", 422)      # 证据不足不可
 # 幂等/唯一性冲突
 ERR_CLAIM_CONFLICT = ("CLAIM_CONFLICT", 409)                 # 同订单同键换类型
 ERR_CLAIM_ALREADY_ACCEPTED = ("CLAIM_ALREADY_ACCEPTED", 409)  # 同订单同类型已有凭证
+
+# 理赔待办快照（跨订单）
+ERR_CURSOR_INVALID = ("CURSOR_INVALID", 422)      # 游标格式错误/指向不存在快照/页码越界
+ERR_CURSOR_EXPIRED = ("CURSOR_EXPIRED", 410)      # 游标自快照创建起 30 分钟过期

@@ -2,14 +2,14 @@
 import json
 import secrets
 import sqlite3
-from datetime import datetime
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from . import constants as C
 from . import db
 from .db import q, q1
-from .engine import (diagnose_business_days, evaluate, parse_cutoff, parse_dt,
-                     resolve_policy, to_local, utc_now)
+from .engine import (diagnose_business_days, evaluate, load_policy,
+                     parse_cutoff, parse_dt, resolve_policy, to_local, utc_now)
 from .errors import AppError
 from .schemas import CreateOrderRequest, EventIn
 
@@ -841,3 +841,164 @@ def diagnose_calendar(req) -> dict:
         "calendar_declared_days": len(cal),
         **result,
     }
+
+
+# ---------------------------------------------------------------- 理赔待办快照（跨订单）
+
+# 游标自快照创建起 30 分钟过期
+TODO_CURSOR_TTL = timedelta(minutes=30)
+
+TODO_SNAPSHOT_NOTE = (
+    "快照自首请求起固定：游标翻页期间即使有新订单、扫描或凭证，"
+    "既有条目、总数与顺序也不改变；各类型资格按核对时刻以订单锁定的政策版本、"
+    "订单时区与节假日表重算，未采用任何归档快照"
+)
+
+
+def _new_snapshot_id(now: datetime) -> str:
+    return f"TS-{now.strftime('%Y%m%d%H%M%S')}-{secrets.token_hex(4).upper()}"
+
+
+def _todo_entries(as_of_utc: datetime) -> list[dict]:
+    """按核对时刻重算全部纳入订单的三类理赔资格，生成冻结条目。
+
+    - 只纳入不晚于 as_of 创建的订单、到达的扫描事件和受理的凭证；
+    - 每单按下单时锁定的政策版本、订单时区与节假日表实时重算（不读归档快照）；
+    - 已有凭证的类型一律不可再次申请；其余类型按各自判定（filable 才可申请）。
+    """
+    orders = q("SELECT * FROM orders WHERE created_at <= ? ORDER BY order_id",
+               (as_of_utc.isoformat(),))
+    entries: list[dict] = []
+    for order_row in orders:
+        order = dict(order_row)
+        policy = load_policy(order["created_policy"])
+        rows = q(
+            "SELECT * FROM events WHERE order_id = ? AND arrived_at <= ? "
+            "ORDER BY arrived_at",
+            (order["order_id"], as_of_utc.isoformat()),
+        )
+        vouchers = q(
+            "SELECT claim_type, claim_no FROM claim_vouchers "
+            "WHERE order_id = ? AND accepted_at <= ? ORDER BY claim_no",
+            (order["order_id"], as_of_utc.isoformat()),
+        )
+        voucher_map: dict[str, list[str]] = {}
+        for v in vouchers:
+            voucher_map.setdefault(v["claim_type"], []).append(v["claim_no"])
+
+        det = evaluate(order, [dict(r) for r in rows], policy, as_of=as_of_utc)
+        for c in det["claims"]:
+            claim_type = c["claim_type"]
+            voucher_nos = voucher_map.get(claim_type, [])
+            entries.append({
+                "order_id": order["order_id"],
+                "claim_type": claim_type,
+                "claim_name": c["claim_name"],
+                "status": c["status"],
+                "deadline_local": c["deadline_local"],
+                "deadline_utc": c["deadline_utc"],
+                "missing_evidence": c["missing_evidence"],
+                "voucher_nos": voucher_nos,
+                # 已有凭证的类型一律不可再次申请；其他类型保持各自判定
+                "can_apply_again": not voucher_nos and c["status"] == "filable",
+            })
+    # 按订单号、理赔类型（固定次序 delay -> damage -> loss）排序
+    entries.sort(key=lambda e: (e["order_id"], C.ALL_CLAIMS.index(e["claim_type"])))
+    return entries
+
+
+def _page_count(total: int, page_size: int) -> int:
+    return max(1, (total + page_size - 1) // page_size)
+
+
+def _snapshot_page_payload(row, page: int) -> dict:
+    """从冻结的快照行切出指定页；条目、总数与顺序均以首请求时冻结的内容为准。"""
+    entries = json.loads(row["entries_json"])
+    page_size = row["page_size"]
+    total = row["total"]
+    pages = _page_count(total, page_size)
+    start = (page - 1) * page_size
+    next_cursor = f"{row['snapshot_id']}:{page + 1}" if page < pages else None
+    return {
+        "snapshot_id": row["snapshot_id"],
+        "as_of_utc": row["as_of"],
+        "created_at_utc": row["created_at"],
+        "expires_at_utc": row["expires_at"],
+        "cursor_ttl_seconds": int(TODO_CURSOR_TTL.total_seconds()),
+        "page_size": page_size,
+        "total": total,
+        "page": page,
+        "page_count": pages,
+        "entries": entries[start:start + page_size],
+        "next_cursor": next_cursor,
+        "note": TODO_SNAPSHOT_NOTE,
+    }
+
+
+def create_todo_snapshot(req) -> dict:
+    """首请求：按核对时刻冻结完整待办结果，返回第 1 页与下一游标。"""
+    as_of_utc = parse_dt(req.as_of)
+    now = utc_now()
+    expires = now + TODO_CURSOR_TTL
+    with db.tx() as conn:
+        entries = _todo_entries(as_of_utc)
+        snapshot_id = _new_snapshot_id(now)
+        for _ in range(3):
+            try:
+                conn.execute(
+                    """INSERT INTO todo_snapshots(
+                           snapshot_id, as_of, page_size, total, entries_json,
+                           created_at, expires_at)
+                       VALUES (?,?,?,?,?,?,?)""",
+                    (snapshot_id, as_of_utc.isoformat(), req.page_size,
+                     len(entries), json.dumps(entries, ensure_ascii=False),
+                     now.isoformat(), expires.isoformat()),
+                )
+                break
+            except sqlite3.IntegrityError:
+                snapshot_id = _new_snapshot_id(now)   # 编号撞号（极小概率）：换号重试
+        else:
+            raise AppError("SNAPSHOT_CREATE_FAILED", "快照创建失败，请重试", 500)
+    row = q1("SELECT * FROM todo_snapshots WHERE snapshot_id = ?", (snapshot_id,))
+    return _snapshot_page_payload(row, 1)
+
+
+def get_todo_snapshot_page(cursor: str) -> dict:
+    """游标翻页：只读取首请求冻结的快照，不重新计算。
+
+    游标无效（格式错误/指向不存在的快照/页码越界）返回 422 CURSOR_INVALID；
+    游标自快照创建起 30 分钟过期，过期返回 410 CURSOR_EXPIRED。
+    """
+    snapshot_id, sep, page_text = (cursor or "").rpartition(":")
+    page = int(page_text) if sep and page_text.isdigit() else 0
+    row = q1("SELECT * FROM todo_snapshots WHERE snapshot_id = ?",
+             (snapshot_id,)) if sep and snapshot_id else None
+    if row is None or page < 1:
+        raise AppError(
+            "CURSOR_INVALID",
+            "游标无效：请使用上一页响应中的 next_cursor 原样翻页",
+            422,
+            {"cursor": cursor},
+        )
+    expires = parse_dt(row["expires_at"])
+    if utc_now() > expires:
+        raise AppError(
+            "CURSOR_EXPIRED",
+            f"游标已过期：快照创建于 {row['created_at']}，游标自快照创建起 "
+            f"{int(TODO_CURSOR_TTL.total_seconds() // 60)} 分钟有效，请重新发起首请求",
+            410,
+            {"cursor": cursor,
+             "snapshot_id": snapshot_id,
+             "created_at_utc": row["created_at"],
+             "expires_at_utc": row["expires_at"]},
+        )
+    pages = _page_count(row["total"], row["page_size"])
+    if page > pages:
+        raise AppError(
+            "CURSOR_INVALID",
+            f"游标页码越界：该快照共 {pages} 页，游标指向第 {page} 页",
+            422,
+            {"cursor": cursor, "snapshot_id": snapshot_id,
+             "page": page, "page_count": pages},
+        )
+    return _snapshot_page_payload(row, page)

@@ -88,6 +88,19 @@ class ClaimSubmitRequest(BaseModel):
         return v
 
 
+class TodoSnapshotRequest(BaseModel):
+    """理赔待办快照首请求入参：带偏移的核对时刻 + 每页条数（1～100）。"""
+    as_of: datetime = Field(
+        description="核对时刻，必须带时区偏移，如 2025-02-20T12:00:00+08:00；"
+                    "只纳入不晚于该时刻创建的订单、到达的扫描和受理的凭证")
+    page_size: int = Field(ge=1, le=100, description="每页条数，1～100")
+
+    @field_validator("as_of")
+    @classmethod
+    def _as_of_tz(cls, v):
+        return _aware(v, "as_of")
+
+
 class CalendarDiagnoseRequest(BaseModel):
     """节假日表工作日诊断入参（只读）。"""
     calendar_code: str = Field(min_length=1, description="已有节假日表代码，如 CN")

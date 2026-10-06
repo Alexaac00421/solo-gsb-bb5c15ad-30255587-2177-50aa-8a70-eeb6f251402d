@@ -85,6 +85,18 @@ CREATE TABLE IF NOT EXISTS claim_vouchers (
     UNIQUE (order_id, claim_type)
 );
 CREATE INDEX IF NOT EXISTS idx_vouchers_order ON claim_vouchers(order_id);
+
+-- 跨订单理赔待办快照：首请求冻结完整结果（按订单号、理赔类型排序），
+-- 游标翻页期间条目/总数/顺序不变；游标自快照创建起 30 分钟过期。
+CREATE TABLE IF NOT EXISTS todo_snapshots (
+    snapshot_id  TEXT PRIMARY KEY,          -- 快照编号（游标的组成部分）
+    as_of        TEXT NOT NULL,             -- UTC ISO8601，核对时刻
+    page_size    INTEGER NOT NULL,          -- 每页条数（1～100）
+    total        INTEGER NOT NULL,          -- 条目总数（纳入订单数 × 3）
+    entries_json TEXT NOT NULL,             -- 冻结的完整条目（不可变）
+    created_at   TEXT NOT NULL,             -- UTC 快照创建时刻（游标过期起算点）
+    expires_at   TEXT NOT NULL              -- created_at + 30 分钟
+);
 """
 
 

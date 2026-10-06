@@ -11,9 +11,10 @@ from . import db
 from .errors import AppError
 from .schemas import (CalendarDiagnoseRequest, ClaimSubmitRequest,
                       CreateOrderRequest, EventBatchRequest, EventIn,
-                      EventPreviewRequest)
+                      EventPreviewRequest, TodoSnapshotRequest)
 from .services import (archive_determination, create_order,
-                       determination_history, diagnose_calendar, get_voucher,
+                       create_todo_snapshot, determination_history,
+                       diagnose_calendar, get_todo_snapshot_page, get_voucher,
                        ingest_events, list_events, list_vouchers,
                        live_determination, preview_events, submit_claim)
 
@@ -26,9 +27,10 @@ async def lifespan(_: FastAPI):
 
 app = FastAPI(
     title="快递理赔时限判定服务",
-    version="1.2.0",
+    version="1.3.0",
     description="按订单创建时生效政策版本判定理赔申请时限；支持时区/节假日、事件去重、"
-                "迟到更正与幂等理赔申请凭证；并提供只读的节假日表工作日诊断。",
+                "迟到更正与幂等理赔申请凭证；提供只读的节假日表工作日诊断，"
+                "以及面向运营的跨订单理赔待办快照（游标翻页、30 分钟过期）。",
     lifespan=lifespan,
 )
 
@@ -177,6 +179,31 @@ def api_list_claims(order_id: str):
 def api_get_claim(claim_no: str):
     """按申请编号查询凭证及其所依据的判定代号与冻结判定。"""
     return get_voucher(claim_no)
+
+
+# ------------------------------------------------------------ 理赔待办快照（跨订单）
+
+@app.post("/api/v1/claim-todos", status_code=201)
+def api_create_todo_snapshot(req: TodoSnapshotRequest):
+    """首请求：按带偏移的核对时刻生成跨订单理赔待办快照。
+
+    只纳入不晚于核对时刻创建的订单、到达的扫描和受理的凭证；按订单锁定的
+    政策版本、订单时区与节假日表重算三类理赔资格（归档快照不替代该时点重算）。
+    完整结果自本请求起固定，按订单号、理赔类型排序；返回第 1 页（总数、条目、
+    下一游标）。核对时刻缺失偏移、每页条数越出 1～100 均返回 422。
+    """
+    return create_todo_snapshot(req)
+
+
+@app.get("/api/v1/claim-todos")
+def api_todo_snapshot_page(cursor: str):
+    """游标翻页：返回上一页响应中 next_cursor 指向的一页。
+
+    翻页期间即使有新订单、扫描或凭证，既有条目、总数与顺序也不改变；
+    游标自快照创建起 30 分钟过期。无效游标返回 422 CURSOR_INVALID，
+    过期游标返回 410 CURSOR_EXPIRED。
+    """
+    return get_todo_snapshot_page(cursor)
 
 
 # ------------------------------------------------------------ 基础数据

@@ -13,7 +13,8 @@
 7. 查询判定历史；
 8. 理赔申请：按接收时间核验受理并生成不可变凭证（含幂等重试/换类型冲突/
    同类型重复受理/非 filable 拒绝/凭证查询）；
-9. 节假日表工作日诊断：只读逐日列出工作/休息判定与截止时刻（含非法参数拒绝）。
+9. 节假日表工作日诊断：只读逐日列出工作/休息判定与截止时刻（含非法参数拒绝）；
+10. 跨订单理赔待办快照：按核对时刻冻结完整结果，游标翻页不受新数据影响。
 """
 import json
 import os
@@ -144,6 +145,7 @@ def main():
 
     claim_demo()
     calendar_diagnose_demo()
+    todo_snapshot_demo()
 
     print("\n示例完成。交互文档：" + BASE + "/docs")
 
@@ -276,6 +278,78 @@ def claim_demo():
     lst = call("GET", f"/api/v1/orders/{oid}/claims")
     if lst:
         print(f"  订单 {oid} 已有凭证 {len(lst['vouchers'])} 张（同类型至多一张）")
+
+
+def todo_snapshot_demo():
+    """跨订单理赔待办快照：首请求冻结完整结果，游标翻页不受新数据影响。"""
+    print("\n\n########## 理赔待办快照（跨订单，游标分页）演示 ##########")
+    o1, o2 = "DEMO-SNAP-001", "DEMO-SNAP-002"
+    if call("POST", "/api/v1/orders", {
+        "order_id": o1, "created_at": "2025-02-05T09:00:00+08:00",
+        "timezone": "Asia/Shanghai", "calendar_code": "CN",
+        "promise_by": "2025-02-10T18:00:00+08:00"}):
+        call("POST", f"/api/v1/orders/{o1}/events", {
+            "event_id": "EV-SNAP-SIGNED-01", "event_type": "signed",
+            "event_time": "2025-02-11T10:00:00+08:00",   # 晚于承诺 -> 延迟成立
+            "arrived_at": "2025-02-11T10:05:00+08:00"})
+    # 受理一张延迟类凭证（重跑时同键幂等返回原凭证），快照中该类型不可再申请
+    call("POST", f"/api/v1/orders/{o1}/claims", {
+        "claim_type": "delay", "idempotency_key": "IDEMP-SNAP-001",
+        "received_at": "2025-02-15T12:00:00+08:00"})
+    call("POST", "/api/v1/orders", {
+        "order_id": o2, "created_at": "2025-02-06T09:00:00+08:00",
+        "timezone": "Asia/Shanghai", "calendar_code": "CN",
+        "promise_by": "2025-02-12T18:00:00+08:00"})
+
+    def show_page(body):
+        print(f"  第 {body['page']}/{body['total_pages']} 页（总数 {body['total']}）：")
+        for i in body["items"]:
+            print(f"    {i['order_id']:<22} {i['claim_type']:<7} {i['status']:<14} "
+                  f"截止 {str(i['deadline_local'] or '-'):<27} "
+                  f"凭证 {str(i['voucher_claim_no'] or '-'):<28} "
+                  f"可再申请={i['can_apply_again']}")
+
+    # 1) 首请求：带偏移的核对时刻 + 每页条数（1～100）-> 冻结完整结果
+    first = call("POST", "/api/v1/claims/todo-snapshots", {
+        "as_of": "2025-02-20T12:00:00+08:00",   # 必须带时区偏移
+        "page_size": 4,                          # 1～100
+    })
+    if first is None:
+        return
+    print(f"\n--- 1) 首请求：快照 {first['snapshot_id']} | 总数 {first['total']} 条 | "
+          f"共 {first['total_pages']} 页 | 游标 {first['cursor_ttl_seconds']} 秒内有效 ---")
+    show_page(first)
+
+    # 2) 快照后再来新订单（创建于核对时刻之前）：翻页结果不受影响
+    call("POST", "/api/v1/orders", {
+        "order_id": "DEMO-SNAP-003", "created_at": "2025-02-19T09:00:00+08:00",
+        "timezone": "Asia/Shanghai", "calendar_code": "CN",
+        "promise_by": "2025-02-25T18:00:00+08:00"})
+    print("\n--- 2) 快照后新建订单 DEMO-SNAP-003，继续用游标翻页 ---")
+    cursor = first["next_cursor"]
+    while cursor:
+        body = call("GET", "/api/v1/claims/todo-snapshots/page",
+                    params={"cursor": cursor})
+        if body is None:
+            return
+        show_page(body)
+        cursor = body["next_cursor"]
+    print("  翻页期间总数/条目/顺序保持不变；DEMO-SNAP-003 不会出现在本快照中")
+
+    # 3) 重新发起首请求则看到最新数据
+    fresh = call("POST", "/api/v1/claims/todo-snapshots", {
+        "as_of": "2025-02-20T12:00:00+08:00", "page_size": 100})
+    if fresh:
+        print(f"\n--- 3) 重新首请求：总数 {fresh['total']}（含新建订单） ---")
+
+    # 4) 明确报错示例：无偏移时刻 / 页大小越界 / 无效游标
+    print("\n--- 4) 明确报错示例 ---")
+    call("POST", "/api/v1/claims/todo-snapshots",
+         {"as_of": "2025-02-20T12:00:00", "page_size": 10})
+    call("POST", "/api/v1/claims/todo-snapshots",
+         {"as_of": "2025-02-20T12:00:00+08:00", "page_size": 500})
+    call("GET", "/api/v1/claims/todo-snapshots/page",
+         params={"cursor": "not-a-valid-cursor"})
 
 
 if __name__ == "__main__":

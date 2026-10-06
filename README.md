@@ -8,6 +8,7 @@
 - 逐条可审计的**判定依据**（含适用政策版本、起算事件、跳节假日说明、更正记录）；
 - **理赔申请受理**：按服务实际接收时间实时核验并出具不可变申请凭证（幂等受理、同类型唯一、可查询）。
 - **节假日表工作日诊断**：提交日历/时区/带偏移起始时刻/工作日数/截止钟点，只读逐日解释第 N 个工作日如何得出（含放假跳过、周末补班计入），返回当地与 UTC 截止时刻。
+- **跨订单理赔待办快照**：按指定核对时刻（带偏移）冻结全部在册订单的三类理赔资格（按时点重算，不采用归档判定），按订单号、理赔类型排序分页；游标翻页 30 分钟内结果不随新订单/扫描/凭证变化。
 
 ## 判定规则
 
@@ -160,11 +161,11 @@ app/
   errors.py        # 业务错误码
   schemas.py       # Pydantic 入参模型与时区/钟点校验
   seed_data.py     # 政策版本 + CN 2024/2025 节假日种子
-  services.py      # 订单、事件摄取、归档/开代、判定装配、理赔申请受理/查询、日历诊断
+  services.py      # 订单、事件摄取、归档/开代、判定装配、理赔申请受理/查询、日历诊断、待办快照
   main.py          # FastAPI 路由
 init_db.py         # 初始化入口（建表 + 种子，幂等）
-examples/call_api.py  # 端到端调用示例（仅标准库，含理赔申请与日历诊断全链路）
-tests/             # pytest 引擎单测 + API 端到端测试（89 个用例）
+examples/call_api.py  # 端到端调用示例（仅标准库，含理赔申请、日历诊断与待办快照全链路）
+tests/             # pytest 引擎单测 + API 端到端测试（109 个用例）
 Dockerfile, docker-compose.yml
 ```
 
@@ -228,6 +229,8 @@ pytest -q
 | POST | `/api/v1/orders/{id}/claims` | **提交理赔申请**：按接收时间实时核验，filable 则出不可变凭证（幂等） |
 | GET | `/api/v1/orders/{id}/claims` | 该订单全部已受理凭证 |
 | GET | `/api/v1/claims/{claim_no}` | 按申请编号查凭证及其判定代号/冻结依据 |
+| POST | `/api/v1/claims/todo-snapshots` | **理赔待办快照（首请求）**：按核对时刻冻结跨订单完整结果，返回第一页与下一游标 |
+| GET | `/api/v1/claims/todo-snapshots/page?cursor=...` | 按游标取后续页（30 分钟内有效，结果不受新数据影响） |
 | GET | `/api/v1/policies` | 政策版本列表 |
 | GET | `/api/v1/calendars/{code}` | 节假日表 |
 | POST | `/api/v1/calendars/diagnose` | **节假日表工作日诊断**（只读）：逐日列出工作/休息判定、补班/放假声明、默认规则、累计工作日数与跳过原因，返回第 N 个工作日的当地/UTC 截止时刻 |
@@ -425,12 +428,83 @@ curl -s -X POST http://localhost:8000/api/v1/orders/O-1001/claims \
 
 > 说明：申请受理不会归档或推进任何"代"；当前代归档与否都按接收时间现算。凭证是只追加（insert-only）数据，无更新/删除接口。
 
+### 理赔待办快照示例（本轮新增）
+
+运营按**指定核对时刻**生成跨订单理赔待办快照，游标分页导出：
+
+- `POST /api/v1/claims/todo-snapshots`（首请求）：提交**带偏移**的核对时刻 `as_of` 与每页条数 `page_size`（**1～100**）；
+- 只纳入不晚于该时刻**创建的订单**（`created_at`）、**到达的扫描**（`arrived_at`）和**受理的凭证**（`received_at`，即服务实际接收申请时间，与理赔核验基准一致）；
+- 每个订单按下单锁定的政策版本、订单时区与节假日表**重算**三类理赔资格——**归档判定不替代该时点重算**；
+- 完整结果按**订单号、理赔类型**（delay → damage → loss 固定次序）排序后冻结，每页返回**总数、条目和下一游标**；
+- 每条返回：订单号、理赔类型、资格状态、当地与 UTC 截止时刻、缺失证据、已有凭证编号（`voucher_claim_no`）和能否再次申请（`can_apply_again`：**已有凭证的类型一律不可再次申请**，其余类型保持各自判定——重算为 `filable` 才可申请）；
+- `GET /api/v1/claims/todo-snapshots/page?cursor=...` 取后续页：翻页期间即使有新订单、扫描或凭证，**既有条目、总数和顺序也不变**；游标自快照创建起 **30 分钟**过期（可用环境变量 `CLAIM_SNAPSHOT_CURSOR_TTL_SECONDS` 调整）。
+
+```bash
+# 首请求：创建快照并取第一页
+curl -s -X POST http://localhost:8000/api/v1/claims/todo-snapshots \
+  -H 'Content-Type: application/json' \
+  -d '{"as_of": "2025-02-20T12:00:00+08:00", "page_size": 2}'
+
+# 后续页：带上一次响应的 next_cursor，直到 next_cursor 为 null
+curl -s "http://localhost:8000/api/v1/claims/todo-snapshots/page?cursor=<NEXT_CURSOR>"
+```
+
+响应节选（第一页；`O-1001` 延迟类已有受理凭证，故不可再次申请）：
+
+```json
+{
+  "snapshot_id": "TS-20250220040000-1A2B3C4D",
+  "as_of_utc": "2025-02-20T04:00:00+00:00",
+  "created_at_utc": "2025-02-20T04:00:00.123456+00:00",
+  "expires_at_utc": "2025-02-20T04:30:00.123456+00:00",
+  "cursor_ttl_seconds": 1800,
+  "page": 1, "total_pages": 2, "total": 3, "page_size": 2,
+  "items": [
+    {"order_id": "O-1001", "claim_type": "delay", "claim_name": "延迟送达",
+     "status": "filable",
+     "deadline_local": "2025-02-25T23:59:59+08:00",
+     "deadline_utc": "2025-02-25T15:59:59+00:00",
+     "missing_evidence": [],
+     "voucher_claim_no": "CLM-20250215040000-9F2A1C77",
+     "can_apply_again": false},
+    {"order_id": "O-1001", "claim_type": "damage", "claim_name": "货物破损",
+     "status": "pending", "deadline_local": null, "deadline_utc": null,
+     "missing_evidence": ["damage_reported"],
+     "voucher_claim_no": null, "can_apply_again": false}
+  ],
+  "next_cursor": "eyJzaWQiOiJUUy0yMDI1MDIyMDA0MDAwMC0xQTJCM0M0RCIsInBhZ2UiOjJ9.9c1f…",
+  "sorted_by": "order_id ASC, claim_type（delay → damage → loss 固定次序）",
+  "frozen": true
+}
+```
+
+明确拒绝（均为统一错误体）：
+
+| 情形 | 状态码 | 错误码 |
+|---|---|---|
+| `as_of` 无时区偏移（naive）/ 缺 `as_of` 或 `page_size` | 422 | `INVALID_REQUEST` |
+| `page_size` 不在 1～100 | 422 | `INVALID_REQUEST` |
+| 缺 `cursor` 查询参数 | 422 | `INVALID_REQUEST` |
+| 游标无法解析 / 校验失败 / 快照不存在 / 页码越界 | 422 | `SNAPSHOT_CURSOR_INVALID` |
+| 游标自快照创建起超过 30 分钟 | 410 | `SNAPSHOT_CURSOR_EXPIRED` |
+
+> 说明：快照为只追加数据（新表 `todo_snapshots`），不影响订单、事件、凭证与归档；游标经 HMAC 签名（密钥随库持久化于 `app_meta`），重启后未过期游标仍有效。
+
 ## 设计取舍与扩展
 
 - **存储**：SQLite + 进程内互斥锁，事件"顺序校验 + 插入"在单事务内完成；水平扩展或多副本时把 `app/db.py` 换成 Postgres（事件表加 `(order_id, arrived_at)` 约束即可）。
 - **新增政策版本**：向 `policies` 表插入一行 JSON（时限天数、工作日/自然日、截止钟点均可配），无需发版；新增节假日在 `calendars` 表 upsert。
 - **新增理赔类型/扫描事件**：在 `constants.py` 登记标签、政策 JSON 增规则、`engine.py` 增加一个 resolver，接口与代际机制无需改动。
 - 截止钟点默认 23:59:59，可被政策窗口级 `cutoff` 或环境变量 `CLAIM_DEFAULT_CUTOFF` 覆盖。
+
+### v1.3.0 变动（跨订单理赔待办快照）
+
+- 新增 `POST /api/v1/claims/todo-snapshots`（首请求）与 `GET /api/v1/claims/todo-snapshots/page`（游标翻页）：按带偏移核对时刻冻结跨订单完整结果——只纳入不晚于该时刻创建的订单、到达的扫描、受理的凭证；按订单锁定政策/时区/日历重算三类资格（不采用归档判定）；按订单号、理赔类型排序分页，每页返回总数、条目与下一游标。
+- 每条含资格状态、当地/UTC 截止时刻、缺失证据、已有凭证编号与能否再次申请；已有凭证的类型一律不可再次申请，其余类型保持各自判定。
+- 游标 HMAC 签名（密钥随库持久化），自快照创建起 30 分钟过期（`CLAIM_SNAPSHOT_CURSOR_TTL_SECONDS` 可调）；翻页期间新订单/扫描/凭证不影响既有条目、总数与顺序。
+- 新增只追加表 `todo_snapshots` 与元数据表 `app_meta`（建表语句带 `IF NOT EXISTS`，老数据目录重启即自动升级，历史数据不受影响）。
+- 缺失偏移的时刻、越界页大小（1～100）、无效或过期游标均以统一错误体明确拒绝（422 `INVALID_REQUEST` / 422 `SNAPSHOT_CURSOR_INVALID` / 410 `SNAPSHOT_CURSOR_EXPIRED`）。
+- 既有接口与启动方式（`docker compose up --build` 自动初始化）完全不变；测试由 89 个增至 109 个。
 
 ### v1.2.0 变动（节假日表工作日诊断）
 

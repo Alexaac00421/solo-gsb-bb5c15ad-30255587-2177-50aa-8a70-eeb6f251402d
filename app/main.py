@@ -11,9 +11,10 @@ from . import db
 from .errors import AppError
 from .schemas import (CalendarDiagnoseRequest, ClaimSubmitRequest,
                       CreateOrderRequest, EventBatchRequest, EventIn,
-                      EventPreviewRequest)
+                      EventPreviewRequest, TodoSnapshotCreateRequest)
 from .services import (archive_determination, create_order,
-                       determination_history, diagnose_calendar, get_voucher,
+                       create_todo_snapshot, determination_history,
+                       diagnose_calendar, get_todo_snapshot_page, get_voucher,
                        ingest_events, list_events, list_vouchers,
                        live_determination, preview_events, submit_claim)
 
@@ -26,9 +27,10 @@ async def lifespan(_: FastAPI):
 
 app = FastAPI(
     title="快递理赔时限判定服务",
-    version="1.2.0",
+    version="1.3.0",
     description="按订单创建时生效政策版本判定理赔申请时限；支持时区/节假日、事件去重、"
-                "迟到更正与幂等理赔申请凭证；并提供只读的节假日表工作日诊断。",
+                "迟到更正与幂等理赔申请凭证；提供只读的节假日表工作日诊断，"
+                "以及按核对时刻冻结的跨订单理赔待办快照（游标分页）。",
     lifespan=lifespan,
 )
 
@@ -177,6 +179,27 @@ def api_list_claims(order_id: str):
 def api_get_claim(claim_no: str):
     """按申请编号查询凭证及其所依据的判定代号与冻结判定。"""
     return get_voucher(claim_no)
+
+
+# ------------------------------------------------------------ 理赔待办快照（跨订单）
+
+@app.post("/api/v1/claims/todo-snapshots", status_code=201)
+def api_create_todo_snapshot(req: TodoSnapshotCreateRequest):
+    """生成跨订单理赔待办快照（首请求），返回第一页。
+
+    以带偏移的核对时刻 as_of 为基准：只纳入不晚于该时刻创建的订单、到达的
+    扫描和受理的凭证；按订单锁定的政策、订单时区与日历重算三类理赔资格
+    （不采用归档判定）。完整结果按订单号、理赔类型排序后冻结，返回总数、
+    本页条目与下一游标；游标自快照创建起 30 分钟过期。
+    """
+    return create_todo_snapshot(req.as_of, req.page_size)
+
+
+@app.get("/api/v1/claims/todo-snapshots/page")
+def api_todo_snapshot_page(cursor: str):
+    """按游标取待办快照后续页：条目、总数与顺序与首请求一致，
+    翻页期间新订单/扫描/凭证不影响结果；无效或过期游标明确报错。"""
+    return get_todo_snapshot_page(cursor)
 
 
 # ------------------------------------------------------------ 基础数据
